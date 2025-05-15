@@ -1,71 +1,90 @@
 #!/bin/bash
-# === 1. Cập nhật hệ thống ===
-apt-get update -y
-apt-get install -y wget curl sudo net-tools
 
-# === 2. Cho phép đăng nhập SSH bằng mật khẩu và root ===
-sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-echo "root:01062007Tu#" | chpasswd
-systemctl restart sshd
+# ================== CÀI SOCKS5 TỰ ĐỘNG ==================
 
-# === 3. Cài 3proxy ===
-wget -q -O /tmp/3proxy.deb "https://github.com/z3APA3A/3proxy/releases/download/0.9.4/3proxy-0.9.4.x86_64.deb"
-if [ $? -ne 0 ]; then
-    wget -q -O /tmp/3proxy.deb "https://github.com/z3APA3A/3proxy/releases/download/0.9.3/3proxy-0.9.3.x86_64.deb"
+set -e
+
+# Xác định OS
+OS=""
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    case "$ID" in
+        ubuntu|debian) OS="debian" ;;
+        amzn|centos|rhel|rocky|almalinux) OS="redhat" ;;
+        *) echo "Unsupported OS: $ID"; exit 1 ;;
+    esac
+else
+    echo "Cannot detect OS."; exit 1
 fi
-dpkg -i /tmp/3proxy.deb || (apt-get -f install -y && dpkg -i /tmp/3proxy.deb)
-rm -f /tmp/3proxy.deb
 
-# === 4. Cấu hình proxy (port 23456 / user: anhtu / pass: anhtuproxy) ===
-mkdir -p /etc/3proxy/conf
-cat > /etc/3proxy/conf/3proxy.cfg <<EOF
-nserver 1.1.1.1
-nserver 8.8.8.8
-nscache 65536
-timeouts 1 5 30 60 180 1800 15 60
-auth strong
-users anhtu:CL:anhtuproxy
-allow anhtu
-socks -p23456
+# Cài SOCKS5 proxy Dante
+USERNAME="anhtu"
+PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c12)"
+PORT=$(shuf -i 1025-65000 -n1)
+PUBLIC_IP=$(curl -s ifconfig.me || curl -s icanhazip.com || curl -s ipinfo.io/ip)
+
+if [ "$OS" = "debian" ]; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y dante-server curl iptables iptables-persistent
+else
+    yum install -y epel-release
+    yum install -y dante-server curl iptables-services
+    systemctl enable iptables
+    systemctl start iptables
+fi
+
+# Tạo user
+id "$USERNAME" &>/dev/null || useradd -M -N -s /usr/sbin/nologin "$USERNAME"
+echo "$USERNAME:$PASSWORD" | chpasswd
+
+# Cấu hình Dante
+cat > /etc/danted.conf <<EOF
+logoutput: syslog /var/log/danted.log
+internal: 0.0.0.0 port = $PORT
+external: eth0
+method: pam
+user.privileged: root
+user.notprivileged: nobody
+
+client pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect disconnect error
+}
+
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    command: bind connect udpassociate
+    log: connect disconnect error
+}
 EOF
 
-# === 5. Tạo service tự khởi động sau reboot ===
-cat > /etc/systemd/system/3proxy.service <<EOF
-[Unit]
-Description=3proxy SOCKS5 Service
-After=network.target
+chmod 644 /etc/danted.conf
+systemctl restart danted
+systemctl enable danted
 
-[Service]
-ExecStart=/usr/bin/3proxy /etc/3proxy/conf/3proxy.cfg
-Restart=always
+# Mở firewall
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow ${PORT}/tcp
+else
+    iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT
+    iptables-save > /etc/iptables/rules.v4 || true
+fi
 
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reexec
-systemctl daemon-reload
-systemctl enable 3proxy
-systemctl restart 3proxy
-
-# === 6. Gửi thông tin về Telegram ===
+# ================== GỬI VỀ TELEGRAM ==================
 BOT_TOKEN="7661562599:AAG5AvXpwl87M5up34-nj9AvMiJu-jYuWlA"
 CHAT_ID="7051936083"
-IP=$(curl -s ifconfig.me || curl -s icanhazip.com)
 
-MESSAGE="🎯 Proxy Created!
-➡️ $IP:23456
-👤 anhtu
-🔑 anhtuproxy
+MSG="🎯 SOCKS5 Proxy Created!
+➡️ ${PUBLIC_IP}:${PORT}
+👤 ${USERNAME}
+🔑 ${PASSWORD}
 
--> $IP:23456:anhtu:anhtuproxy
-
-🔹 SSH VPS
-➡️ $IP
-👤 root
-🔑 01062007Tu#
--> Cách Login Vào VPS Trên Command : ssh root@$IP
+-> ${PUBLIC_IP}:${PORT}:${USERNAME}:${PASSWORD}
 
 ✅ Sẵn sàng!"
-curl -s --data-urlencode "text=$MESSAGE" "https://api.telegram.org/bot$BOT_TOKEN/sendMessage?chat_id=$CHAT_ID"
+
+# Ghi log debug để kiểm tra nếu Telegram lỗi
+echo "PUBLIC_IP=${PUBLIC_IP}" >> /root/tele_debug.log
+curl -s --data-urlencode "text=$MSG" \
+  "https://api.telegram.org/bot$BOT_TOKEN/sendMessage?chat_id=$CHAT_ID" \
+  >> /root/tele_debug.log 2>&1

@@ -22,6 +22,7 @@ USERNAME="anhtu"
 PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c12)"
 PORT=$(shuf -i 1025-65000 -n1)
 PUBLIC_IP=$(curl -s ifconfig.me || curl -s icanhazip.com || curl -s ipinfo.io/ip)
+EXTERNAL_IF=$(ip -o -4 route show to default | awk '{print $5}')
 
 if [ "$OS" = "debian" ]; then
     apt-get update
@@ -41,7 +42,7 @@ echo "$USERNAME:$PASSWORD" | chpasswd
 cat > /etc/danted.conf <<EOF
 logoutput: syslog /var/log/danted.log
 internal: 0.0.0.0 port = $PORT
-external: eth0
+external: $EXTERNAL_IF
 method: pam
 user.privileged: root
 user.notprivileged: nobody
